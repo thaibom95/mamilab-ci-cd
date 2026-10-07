@@ -1,0 +1,208 @@
+# ============================================================
+# MamiLab — GitHub Actions CI/CD Deployment Workflow
+#
+# File này thuộc GitHub public repo (mamilab-ci-cd).
+# KHÔNG commit source code mamilab vào repo này.
+#
+# Trigger:
+# 1. repository_dispatch từ mamilab (khi merge/push vào main).
+# 2. workflow_dispatch (chạy thủ công từ giao diện GitHub Actions).
+#
+# GitHub Secrets cần thiết trong repo mamilab-ci-cd:
+#   - MAMILAB_SOURCE_TOKEN : GitHub PAT (scope: repo) để clone source private
+#   - MAMILAB_VPS_HOST     : 103.166.182.62
+#   - MAMILAB_VPS_PORT     : 24700
+#   - MAMILAB_VPS_USER     : root
+#   - MAMILAB_VPS_SSH_KEY  : Nội dung private key (~/.ssh/id_ed25519)
+# ============================================================
+
+name: Deploy MamiLab
+
+on:
+  repository_dispatch:
+    types: [deploy-mamilab]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'Commit SHA cần deploy (để trống để lấy commit mới nhất nhánh main)'
+        required: false
+        default: ''
+
+concurrency:
+  group: deploy-mamilab-prod
+  cancel-in-progress: false
+
+jobs:
+  # ── 1. Backup SQLite Database trên VPS TRƯỚC khi deploy ─────
+  backup-db:
+    name: "Backup Database (VPS)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Backup SQLite on VPS
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.MAMILAB_VPS_HOST }}
+          port: ${{ secrets.MAMILAB_VPS_PORT }}
+          username: ${{ secrets.MAMILAB_VPS_USER }}
+          key: ${{ secrets.MAMILAB_VPS_SSH_KEY }}
+          script_stop: true
+          command_timeout: 10m
+          script: |
+            set -eu
+            BACKUP_DIR="/var/www/mamilab/backups/sqlite"
+            mkdir -p "$BACKUP_DIR"
+            DB_FILE="/var/www/mamilab/backend/database/database.sqlite"
+            SHA_INPUT="${{ github.event.client_payload.sha || github.event.inputs.sha || '' }}"
+            SHA_SHORT=$(echo "${SHA_INPUT:-latest}" | cut -c1-8)
+            OUT="$BACKUP_DIR/db_$(date +%Y%m%d_%H%M%S)_pre-${SHA_SHORT}.sqlite"
+
+            if [ -f "$DB_FILE" ] && [ -s "$DB_FILE" ]; then
+              echo "Tiến hành backup SQLite trước khi deploy..."
+              if docker ps --format '{{.Names}}' | grep -qx "mamilab-backend"; then
+                docker exec -T mamilab-backend sqlite3 database/database.sqlite ".backup database/backup_tmp.sqlite"
+                mv /var/www/mamilab/backend/database/backup_tmp.sqlite "$OUT"
+              else
+                cp "$DB_FILE" "$OUT"
+              fi
+              gzip -f "$OUT"
+              gzip -t "$OUT.gz"
+              echo "✓ Backup thành công: $OUT.gz ($(du -h "$OUT.gz" | cut -f1))"
+
+              # Tự động xoá, chỉ giữ lại 30 bản sao lưu mới nhất
+              ls -1t "$BACKUP_DIR"/*.sqlite.gz 2>/dev/null | tail -n +31 | xargs -r rm -f --
+            else
+              echo "ℹ️ Không tìm thấy database.sqlite hoặc DB rỗng. Tiếp tục deploy."
+            fi
+
+  # ── 2. Build Frontend & Deploy toàn bộ lên VPS ──────────────
+  build-and-deploy:
+    name: "Build & Deploy"
+    needs: backup-db
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve Target SHA
+        id: resolve-sha
+        run: |
+          TARGET_SHA="${{ github.event.client_payload.sha || github.event.inputs.sha || '' }}"
+          echo "target_sha=$TARGET_SHA" >> $GITHUB_OUTPUT
+
+      - name: Clone mamilab source
+        run: |
+          git clone \
+            "https://x-access-token:${{ secrets.MAMILAB_SOURCE_TOKEN }}@github.com/thaibom95/mamilab.git" \
+            source
+          cd source
+          if [ -n "${{ steps.resolve-sha.outputs.target_sha }}" ]; then
+            git checkout "${{ steps.resolve-sha.outputs.target_sha }}"
+          else
+            git checkout main
+          fi
+          echo "Đang deploy commit: $(git rev-parse --short HEAD)"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: source/frontend/pnpm-lock.yaml
+
+      - name: Build Frontend (Next.js Static Export)
+        working-directory: source/frontend
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build
+
+      - name: Package Release Bundle
+        run: |
+          cd source
+          # Đóng gói code release, loại trừ dữ liệu máy chủ nhạy cảm
+          tar -czf ../mamilab-release.tar.gz \
+            --exclude='backend/.env' \
+            --exclude='backend/database/*.sqlite*' \
+            --exclude='backend/storage' \
+            --exclude='backend/vendor' \
+            --exclude='backend/node_modules' \
+            --exclude='frontend/node_modules' \
+            --exclude='frontend/src' \
+            --exclude='.git' \
+            backend docker docker-compose.yml frontend/out
+
+      - name: Upload Release to VPS
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.MAMILAB_VPS_HOST }}
+          port: ${{ secrets.MAMILAB_VPS_PORT }}
+          username: ${{ secrets.MAMILAB_VPS_USER }}
+          key: ${{ secrets.MAMILAB_VPS_SSH_KEY }}
+          source: "mamilab-release.tar.gz"
+          target: "/var/www/mamilab"
+
+      - name: Extract & Apply Release on VPS
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.MAMILAB_VPS_HOST }}
+          port: ${{ secrets.MAMILAB_VPS_PORT }}
+          username: ${{ secrets.MAMILAB_VPS_USER }}
+          key: ${{ secrets.MAMILAB_VPS_SSH_KEY }}
+          script_stop: true
+          command_timeout: 30m
+          script: |
+            set -eu
+            cd /var/www/mamilab
+
+            # Giải nén đè mã nguồn mới
+            tar -xzf mamilab-release.tar.gz
+            rm -f mamilab-release.tar.gz
+
+            # Đảm bảo các thư mục lưu trữ cần thiết tồn tại
+            mkdir -p backend/storage/app/public backend/storage/app/private backend/storage/app/tmp
+            mkdir -p backend/storage/framework/cache/data backend/storage/framework/sessions backend/storage/framework/views
+            mkdir -p backend/storage/logs backend/bootstrap/cache backend/database
+
+            # Cấp quyền cho www-data
+            chown -R www-data:www-data backend/storage backend/bootstrap/cache backend/database
+            chmod -R 775 backend/storage backend/bootstrap/cache backend/database
+
+            # Cập nhật composer packages bên trong container backend
+            docker compose exec -T backend composer install --no-dev --optimize-autoloader --no-interaction
+
+            # Chạy migration database
+            docker compose exec -T backend php artisan migrate --force
+
+            # Cache cấu hình, routes, views để đạt tốc độ tối đa
+            docker compose exec -T backend php artisan config:cache
+            docker compose exec -T backend php artisan route:cache
+            docker compose exec -T backend php artisan view:cache
+            docker compose exec -T backend php artisan storage:link || true
+
+            # Khởi động lại background queue worker
+            docker compose exec -T backend php artisan queue:restart
+
+            # Reload Nginx để áp dụng static files và route mới
+            docker compose exec -T nginx nginx -s reload || docker compose restart nginx
+
+            echo "✓ Áp dụng release lên máy chủ hoàn tất!"
+
+      - name: Healthcheck
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.MAMILAB_VPS_HOST }}
+          port: ${{ secrets.MAMILAB_VPS_PORT }}
+          username: ${{ secrets.MAMILAB_VPS_USER }}
+          key: ${{ secrets.MAMILAB_VPS_SSH_KEY }}
+          script_stop: true
+          command_timeout: 5m
+          script: |
+            echo "Đang kiểm tra phản hồi từ hệ thống..."
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1/api/master || echo "000")
+            if [ "$STATUS" = "200" ]; then
+              echo "✓ Healthcheck PASSED: Backend API phản hồi 200 OK!"
+            else
+              echo "❌ Cảnh báo: API phản hồi HTTP $STATUS"
+              exit 1
+            fi

@@ -1,0 +1,14 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Archives
+*.tar.gz
+*.zip
+
+# Local secrets / keys
+*.pem
+*.key
+id_*
+.env*
+!.env.example
