@@ -226,7 +226,7 @@ jobs:
           command_timeout: 5m
           script: |
             echo "Đang kiểm tra phản hồi từ hệ thống..."
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1/api/master || echo "000")
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" -H "Host: mamilab.vn" http://127.0.0.1/api/shop/master || echo "000")
             if [ "$STATUS" = "200" ]; then
               echo "✓ Healthcheck PASSED: Backend API phản hồi 200 OK!"
             else
