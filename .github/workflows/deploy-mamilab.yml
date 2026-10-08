@@ -49,17 +49,35 @@ jobs:
           command_timeout: 10m
           script: |
             set -eu
+            SHA_INPUT="${{ github.event.client_payload.sha || github.event.inputs.sha || '' }}"
+            SHA_SHORT=$(echo "${SHA_INPUT:-latest}" | cut -c1-8)
+            STAMP=$(date +%Y%m%d_%H%M%S)
+
+            if docker ps --format '{{.Names}}' | grep -qx "mamilab-mysql"; then
+              MYSQL_DIR="/var/www/mamilab/backups/mysql"
+              mkdir -p "$MYSQL_DIR"
+              OUT="$MYSQL_DIR/db_${STAMP}_pre-${SHA_SHORT}.sql.gz"
+              echo "Tiến hành backup MySQL trước khi deploy..."
+              docker exec mamilab-mysql sh -c 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" exec mysqldump -uroot --single-transaction --quick --routines --triggers --no-tablespaces --default-character-set=utf8mb4 "$MYSQL_DATABASE"' | gzip > "$OUT"
+              gzip -t "$OUT"
+              if [ "$(gzip -dc "$OUT" | head -c 100000 | grep -c 'CREATE TABLE')" -eq 0 ]; then
+                echo "❌ Bản backup MySQL rỗng hoặc lỗi: $OUT"
+                exit 1
+              fi
+              echo "✓ Backup MySQL thành công: $OUT ($(du -h "$OUT" | cut -f1))"
+              ls -1t "$MYSQL_DIR"/*.sql.gz 2>/dev/null | tail -n +31 | xargs -r rm -f --
+              exit 0
+            fi
+
             BACKUP_DIR="/var/www/mamilab/backups/sqlite"
             mkdir -p "$BACKUP_DIR"
             DB_FILE="/var/www/mamilab/backend/database/database.sqlite"
-            SHA_INPUT="${{ github.event.client_payload.sha || github.event.inputs.sha || '' }}"
-            SHA_SHORT=$(echo "${SHA_INPUT:-latest}" | cut -c1-8)
-            OUT="$BACKUP_DIR/db_$(date +%Y%m%d_%H%M%S)_pre-${SHA_SHORT}.sqlite"
+            OUT="$BACKUP_DIR/db_${STAMP}_pre-${SHA_SHORT}.sqlite"
 
             if [ -f "$DB_FILE" ] && [ -s "$DB_FILE" ]; then
               echo "Tiến hành backup SQLite trước khi deploy..."
               if docker ps --format '{{.Names}}' | grep -qx "mamilab-backend"; then
-                docker exec -T mamilab-backend sqlite3 database/database.sqlite ".backup database/backup_tmp.sqlite"
+                docker exec mamilab-backend sqlite3 database/database.sqlite ".backup database/backup_tmp.sqlite"
                 mv /var/www/mamilab/backend/database/backup_tmp.sqlite "$OUT"
               else
                 cp "$DB_FILE" "$OUT"
@@ -167,6 +185,15 @@ jobs:
             # Cấp quyền cho www-data
             chown -R www-data:www-data backend/storage backend/bootstrap/cache backend/database
             chmod -R 775 backend/storage backend/bootstrap/cache backend/database
+
+            # Sau khi đã chuyển sang MySQL: build lại image và tạo lại container khi Dockerfile/compose thay đổi
+            if docker ps --format '{{.Names}}' | grep -qx "mamilab-mysql"; then
+              docker compose up -d --build --remove-orphans
+              for i in $(seq 1 60); do
+                if docker compose exec -T backend php artisan --version >/dev/null 2>&1; then break; fi
+                sleep 2
+              done
+            fi
 
             # Cập nhật composer packages bên trong container backend
             docker compose exec -T backend composer install --no-dev --optimize-autoloader --no-interaction
